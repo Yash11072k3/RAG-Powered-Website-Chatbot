@@ -1,0 +1,7 @@
+streamlit
+faiss-cpu
+sentence-transformers
+playwright
+beautifulsoup4
+requests
+numpy
