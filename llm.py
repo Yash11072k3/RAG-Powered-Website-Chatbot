@@ -1,23 +1,57 @@
+import re
 import requests
 
-WEBSITE_ONLY_FALLBACK = "This information is not in the website."
+WEBSITE_ONLY_FALLBACK = "This information is not in this website."
 
 
 def clean_response(text: str) -> str:
     if not text:
         return WEBSITE_ONLY_FALLBACK
 
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    # Remove leaked prompt/instruction text
+    stop_patterns = [
+        r"User:.*",
+        r"Assistant:.*",
+        r"STRICT RULES:.*",
+        r"Use ONLY the WEBSITE CONTEXT.*",
+        r"Do NOT use your own knowledge.*",
+        r"Do NOT guess.*",
+        r"Do NOT answer from general knowledge.*",
+        r"Do NOT add examples.*",
+        r"Do NOT continue.*",
+        r"WEBSITE CONTEXT:.*",
+        r"Question:.*",
+        r"Answer:.*"
+    ]
 
-    seen = set()
-    unique_lines = []
-    for line in lines:
-        if line not in seen:
-            unique_lines.append(line)
-            seen.add(line)
+    cleaned = text.strip()
 
-    cleaned = "\n".join(unique_lines).strip()
-    return cleaned if cleaned else WEBSITE_ONLY_FALLBACK
+    for pattern in stop_patterns:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    cleaned = cleaned.strip()
+
+    # Remove repeated spaces/newlines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+
+    # If model starts quoting weirdly
+    cleaned = cleaned.strip(' "\'')
+
+    # If response got cut mid-way, trim to last full sentence
+    sentence_end = max(
+        cleaned.rfind("."),
+        cleaned.rfind("!"),
+        cleaned.rfind("?")
+    )
+
+    if sentence_end > 50:
+        cleaned = cleaned[:sentence_end + 1]
+
+    if not cleaned:
+        return WEBSITE_ONLY_FALLBACK
+
+    return cleaned
 
 
 def generate_answer(context: str, question: str, model_name: str = "phi") -> str:
@@ -32,20 +66,20 @@ STRICT RULES:
 - Do NOT guess
 - Do NOT answer from general knowledge
 - Do NOT add examples unless they are clearly present in the context
-- Do NOT continue the prompt
-- If the answer is not clearly present in the WEBSITE CONTEXT, reply with exactly:
-This information is not in the website.
-- For summary questions, summarize only the main topics clearly present in the context
-- Keep the answer concise and grounded
+- Do NOT continue the conversation
+- Do NOT write User:
+- Do NOT write Assistant:
+- If the answer is not clearly in the context, respond exactly with:
+This information is not in this website.
 
 WEBSITE CONTEXT:
 {context}
 
-USER QUESTION:
+Question:
 {question}
 
-ANSWER:
-"""
+Answer:
+""".strip()
 
     try:
         response = requests.post(
@@ -55,46 +89,34 @@ ANSWER:
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.0,
-                    "top_p": 0.8,
-                    "num_predict": 140,
-                    "stop": ["USER QUESTION:", "WEBSITE CONTEXT:", "ANSWER:"]
+                    "temperature": 0.1,
+                    "top_p": 0.9,
+                    "num_predict": 200,
+                    "stop": [
+                        "User:",
+                        "Assistant:",
+                        "Question:",
+                        "STRICT RULES:",
+                        "WEBSITE CONTEXT:"
+                    ]
                 }
             },
             timeout=120
         )
 
-        response.raise_for_status()
         data = response.json()
 
-        if "response" in data:
-            answer = clean_response(data["response"])
-            lowered = answer.lower()
+        raw_answer = data.get("response", "").strip()
 
-            forbidden_patterns = [
-                "user question:",
-                "website context:",
-                "answer:",
-                "to make tea",
-                "you will need",
-                "here are the steps",
-            ]
+        if not raw_answer:
+            return WEBSITE_ONLY_FALLBACK
 
-            if any(pattern in lowered for pattern in forbidden_patterns):
-                return WEBSITE_ONLY_FALLBACK
+        cleaned_answer = clean_response(raw_answer)
 
-            return answer if answer else WEBSITE_ONLY_FALLBACK
+        if not cleaned_answer:
+            return WEBSITE_ONLY_FALLBACK
 
-        if "error" in data:
-            return f"⚠️ Ollama Error: {data['error']}"
+        return cleaned_answer
 
-        return "⚠️ Model returned an unexpected response."
-
-    except requests.exceptions.ConnectionError:
-        return "⚠️ Ollama connection failed. Make sure Ollama is running on http://localhost:11434"
-    except requests.exceptions.Timeout:
-        return "⚠️ Ollama took too long to respond."
-    except requests.exceptions.HTTPError as e:
-        return f"⚠️ HTTP Error: {str(e)}"
-    except Exception as e:
-        return f"⚠️ Connection Error: {str(e)}"
+    except Exception:
+        return WEBSITE_ONLY_FALLBACK
