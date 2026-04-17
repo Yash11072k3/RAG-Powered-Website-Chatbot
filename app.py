@@ -15,7 +15,8 @@ def init_session():
         "chunks": None,
         "messages": [],
         "loaded_url": "",
-        "website_text": ""
+        "website_text": "",
+        "website_keywords": set()
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -27,13 +28,21 @@ STOPWORDS = {
     "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "this",
     "that", "these", "those", "about", "with", "from", "by", "it", "as", "be",
     "do", "does", "did", "can", "could", "should", "would", "will", "shall",
-    "tell", "me"
+    "tell", "me", "define", "explain", "article", "website", "page", "meaning"
 }
 
 
 def extract_keywords(text: str):
     words = re.findall(r"[a-zA-Z0-9_]+", text.lower())
     return [w for w in words if len(w) > 2 and w not in STOPWORDS]
+
+
+def build_website_keyword_set(text: str):
+    return set(extract_keywords(text))
+
+
+def extract_question_keywords(question: str):
+    return set(extract_keywords(question))
 
 
 def keyword_overlap_count(question: str, text: str) -> int:
@@ -88,14 +97,14 @@ def is_summary_question(question: str) -> bool:
 
 def build_context(question: str, index, chunks):
     if is_summary_question(question):
-        take_n = min(20, len(chunks))
-        selected_chunks = chunks[:take_n]
-        context = "\n\n".join(selected_chunks).strip()
-        retrieved_chunks = [
-            {"id": i, "text": chunks[i], "score": 0.0}
-            for i in range(take_n)
-        ]
-        return context, retrieved_chunks
+        summary_results = hybrid_search(
+            query=improve_query(question),
+            index=index,
+            chunks=chunks,
+            top_k=8
+        )
+        context = "\n\n".join([r["text"] for r in summary_results]).strip()
+        return context, summary_results
 
     raw_results = hybrid_search(
         query=question,
@@ -130,9 +139,24 @@ def build_context(question: str, index, chunks):
     return context, chosen
 
 
-def is_question_relevant(question: str, index, chunks):
+def is_question_relevant(question: str, index, chunks, website_keywords: set):
     if is_summary_question(question):
         return True, []
+
+    q_keywords = extract_question_keywords(question)
+
+    if not q_keywords:
+        return False, []
+
+    matched_keywords = q_keywords.intersection(website_keywords)
+
+    # strict keyword rule
+    if len(q_keywords) <= 2:
+        if len(matched_keywords) < 1:
+            return False, []
+    else:
+        if len(matched_keywords) < 2:
+            return False, []
 
     results = hybrid_search(
         query=question,
@@ -170,7 +194,6 @@ def load_website_text(url: str) -> str:
 
 
 with st.sidebar:
-
     url = st.text_input("Enter Website URL", value=st.session_state.loaded_url)
 
     if st.button("Load Website", use_container_width=True):
@@ -190,14 +213,19 @@ with st.sidebar:
                     else:
                         embeddings = create_embeddings(chunks)
                         index = store_embeddings(embeddings)
+                        website_keywords = build_website_keyword_set(text)
 
                         st.session_state.index = index
                         st.session_state.chunks = chunks
                         st.session_state.loaded_url = url.strip()
                         st.session_state.website_text = text
+                        st.session_state.website_keywords = website_keywords
                         st.session_state.messages = []
 
-                        st.success(f"✅ Website loaded successfully! Total chunks: {len(chunks)}")
+                        st.success(
+                            f"✅ Website loaded successfully! Total chunks: {len(chunks)} | "
+                            f"Stored keywords: {len(website_keywords)}"
+                        )
 
     if st.session_state.loaded_url:
         st.divider()
@@ -237,7 +265,8 @@ if question:
         relevant, _ = is_question_relevant(
             question=question,
             index=st.session_state.index,
-            chunks=st.session_state.chunks
+            chunks=st.session_state.chunks,
+            website_keywords=st.session_state.website_keywords
         )
 
         with st.chat_message("assistant"):
