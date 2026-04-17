@@ -1,9 +1,10 @@
+import re
 import streamlit as st
 from scraper import scrape_website
 from embeddings import split_text, create_embeddings, store_embeddings, hybrid_search
 from llm import generate_answer, WEBSITE_ONLY_FALLBACK
 
-st.set_page_config(page_title="RAG Powered Website Chatbot", layout="wide")
+st.set_page_config(page_title="RAG-Powered Website Chatbot", layout="wide")
 
 FIXED_MODEL_NAME = "phi"
 
@@ -21,108 +22,106 @@ def init_session():
             st.session_state[key] = value
 
 
-init_session()
+STOPWORDS = {
+    "what", "is", "are", "was", "were", "how", "why", "when", "where", "who",
+    "the", "a", "an", "in", "on", "at", "to", "for", "of", "and", "or", "this",
+    "that", "these", "those", "about", "with", "from", "by", "it", "as", "be",
+    "do", "does", "did", "can", "could", "should", "would", "will", "shall",
+    "tell", "me"
+}
 
-st.title("RAG Powered Website Chatbot")
-st.caption("Ask anything. Answers are grounded only in the loaded website.")
+
+def extract_keywords(text: str):
+    words = re.findall(r"[a-zA-Z0-9_]+", text.lower())
+    return [w for w in words if len(w) > 2 and w not in STOPWORDS]
 
 
-@st.cache_data(show_spinner=False)
-def load_website_text(url: str) -> str:
-    return scrape_website(url)
+def keyword_overlap_count(question: str, text: str) -> int:
+    q_keywords = set(extract_keywords(question))
+    t_keywords = set(extract_keywords(text))
+    return len(q_keywords.intersection(t_keywords))
 
 
 def improve_query(question: str) -> str:
     q = question.lower().strip()
 
     if any(word in q for word in ["summar", "overview", "describe", "explain"]):
-        return "main topic overview key points summary"
+        return "main topic overview summary key points"
 
-    if "what is" in q or "about" in q:
-        return "main topic explanation definition"
+    if any(word in q for word in ["goal", "purpose", "aim", "objective"]):
+        return question + " goal purpose objective"
 
-    if any(word in q for word in ["danger", "dangerous", "risk", "harm", "threat", "safe", "safety"]):
-        return "risks dangers concerns safety issues"
+    if any(word in q for word in ["risk", "danger", "dangerous", "harm", "safe", "safety", "threat"]):
+        return question + " risks concerns harms safety"
 
-    if "application" in q or "applications" in q:
-        return "applications uses examples"
+    if any(word in q for word in ["history", "background", "origin", "started"]):
+        return question + " history background origin development"
 
-    if "history" in q:
-        return "history background development"
+    if any(word in q for word in ["application", "applications", "use", "uses", "used"]):
+        return question + " applications uses examples"
 
-    if "ethics" in q or "ethical" in q:
-        return "ethics concerns issues"
+    if any(word in q for word in ["ethics", "ethical", "bias", "fairness"]):
+        return question + " ethics ethical issues bias fairness"
 
     return question
 
 
 def is_summary_question(question: str) -> bool:
     q = question.lower().strip()
-    return any(word in q for word in [
+    patterns = [
         "summar",
         "overview",
         "entire article",
         "full article",
         "whole article",
-        "whole website",
         "entire website",
+        "whole website",
+        "what is this article about",
+        "what is this website about",
         "describe this page",
         "describe this website",
-        "explain this page",
         "explain this article",
-        "what is this article about",
-        "what is this website about"
-    ])
+        "explain this page",
+    ]
+    return any(pattern in q for pattern in patterns)
 
 
 def build_context(question: str, index, chunks):
     if is_summary_question(question):
-        total = len(chunks)
-
-        if total <= 10:
-            selected_ids = list(range(len(chunks)))
-            selected_chunks = chunks
-        else:
-            positions = [
-                int(total * 0.05),
-                int(total * 0.15),
-                int(total * 0.25),
-                int(total * 0.35),
-                int(total * 0.45),
-                int(total * 0.55),
-                int(total * 0.65),
-                int(total * 0.75),
-                int(total * 0.85),
-                max(int(total * 0.95) - 1, 0)
-            ]
-
-            seen = set()
-            selected_ids = []
-            for pos in positions:
-                pos = max(0, min(pos, total - 1))
-                if pos not in seen:
-                    selected_ids.append(pos)
-                    seen.add(pos)
-
-            selected_chunks = [chunks[i] for i in selected_ids]
-
+        take_n = min(20, len(chunks))
+        selected_chunks = chunks[:take_n]
         context = "\n\n".join(selected_chunks).strip()
         retrieved_chunks = [
-            {"id": chunk_id, "text": chunks[chunk_id], "score": 0.0}
-            for chunk_id in selected_ids
+            {"id": i, "text": chunks[i], "score": 0.0}
+            for i in range(take_n)
         ]
         return context, retrieved_chunks
 
-    search_query = improve_query(question)
-
-    results = hybrid_search(
-        query=search_query,
+    raw_results = hybrid_search(
+        query=question,
         index=index,
         chunks=chunks,
-        top_k=6
+        top_k=4
     )
 
-    chosen = results[:4]
+    improved_results = hybrid_search(
+        query=improve_query(question),
+        index=index,
+        chunks=chunks,
+        top_k=4
+    )
+
+    combined = []
+    seen = set()
+    for group in [raw_results, improved_results]:
+        for item in group:
+            if item["id"] not in seen:
+                combined.append(item)
+                seen.add(item["id"])
+
+    combined.sort(key=lambda x: x["score"], reverse=True)
+
+    chosen = combined[:4]
     context = "\n\n".join([r["text"] for r in chosen]).strip()
 
     if not context:
@@ -135,52 +134,42 @@ def is_question_relevant(question: str, index, chunks):
     if is_summary_question(question):
         return True, []
 
-    # Use original question for relevance
-    raw_results = hybrid_search(
+    results = hybrid_search(
         query=question,
         index=index,
         chunks=chunks,
-        top_k=3
+        top_k=5
     )
 
-    # Use improved query for recall
-    improved_results = hybrid_search(
-        query=improve_query(question),
-        index=index,
-        chunks=chunks,
-        top_k=3
-    )
-
-    combined = []
-    seen_ids = set()
-
-    for group in [raw_results, improved_results]:
-        for item in group:
-            if item["id"] not in seen_ids:
-                combined.append(item)
-                seen_ids.add(item["id"])
-
-    if not combined:
+    if not results:
         return False, []
 
-    best_score = combined[0]["score"]
+    best_score = results[0]["score"]
 
-    question_words = [w for w in question.lower().split() if len(w) > 3]
-    lexical_match_found = False
+    overlap_hits = 0
+    for result in results:
+        overlap_hits = max(overlap_hits, keyword_overlap_count(question, result["text"]))
 
-    for result in combined:
-        chunk_text = result["text"].lower()
-        if any(word in chunk_text for word in question_words):
-            lexical_match_found = True
-            break
+    is_relevant = (
+        best_score >= 0.22 or
+        (best_score >= 0.18 and overlap_hits >= 1)
+    )
 
-    is_relevant = best_score >= 0.28 or (best_score >= 0.20 and lexical_match_found)
+    return is_relevant, results
 
-    return is_relevant, combined
+
+init_session()
+
+st.title("RAG-Powered Website Chatbot")
+st.caption("Ask anything. Answers are grounded only in the loaded website.")
+
+
+@st.cache_data(show_spinner=False)
+def load_website_text(url: str) -> str:
+    return scrape_website(url)
 
 
 with st.sidebar:
-    st.header("⚙️ Settings")
 
     url = st.text_input("Enter Website URL", value=st.session_state.loaded_url)
 

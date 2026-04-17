@@ -1,6 +1,5 @@
 import requests
 
-
 WEBSITE_ONLY_FALLBACK = "This information is not in the website."
 
 
@@ -9,9 +8,9 @@ def clean_response(text: str) -> str:
         return WEBSITE_ONLY_FALLBACK
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+
     seen = set()
     unique_lines = []
-
     for line in lines:
         if line not in seen:
             unique_lines.append(line)
@@ -23,19 +22,21 @@ def clean_response(text: str) -> str:
 
 def generate_answer(context: str, question: str, model_name: str = "phi") -> str:
     prompt = f"""
-You are a strict website-question answering assistant.
+You are a STRICT website-based question answering assistant.
 
-Answer the user's question ONLY from the WEBSITE CONTEXT below.
+You must answer ONLY using the WEBSITE CONTEXT below.
 
 STRICT RULES:
 - Use ONLY the WEBSITE CONTEXT
 - Do NOT use your own knowledge
 - Do NOT guess
-- Do NOT provide general knowledge
-- If the exact answer is not clearly present in the WEBSITE CONTEXT, reply with exactly:
+- Do NOT answer from general knowledge
+- Do NOT add examples unless they are clearly present in the context
+- Do NOT continue the prompt
+- If the answer is not clearly present in the WEBSITE CONTEXT, reply with exactly:
 This information is not in the website.
-- Do not answer unrelated questions
-- Keep the answer concise and grounded only in the context
+- For summary questions, summarize only the main topics clearly present in the context
+- Keep the answer concise and grounded
 
 WEBSITE CONTEXT:
 {context}
@@ -56,7 +57,8 @@ ANSWER:
                 "options": {
                     "temperature": 0.0,
                     "top_p": 0.8,
-                    "num_predict": 180
+                    "num_predict": 140,
+                    "stop": ["USER QUESTION:", "WEBSITE CONTEXT:", "ANSWER:"]
                 }
             },
             timeout=120
@@ -67,18 +69,21 @@ ANSWER:
 
         if "response" in data:
             answer = clean_response(data["response"])
+            lowered = answer.lower()
 
-            lowered = answer.lower().strip()
-            banned_starts = [
+            forbidden_patterns = [
+                "user question:",
+                "website context:",
+                "answer:",
                 "to make tea",
-                "to cut a carrot",
                 "you will need",
                 "here are the steps",
             ]
-            if any(lowered.startswith(x) for x in banned_starts):
+
+            if any(pattern in lowered for pattern in forbidden_patterns):
                 return WEBSITE_ONLY_FALLBACK
 
-            return answer
+            return answer if answer else WEBSITE_ONLY_FALLBACK
 
         if "error" in data:
             return f"⚠️ Ollama Error: {data['error']}"
